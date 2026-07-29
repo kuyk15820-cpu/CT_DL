@@ -1,67 +1,135 @@
-name: Auto Unzip Any Archive
+name: Build & Release
 
 on:
+  workflow_dispatch:
   push:
-    paths:
-      - '**.zip'
+    branches:
+      - release
 
-permissions:
-  contents: write
+env:
+  THEOS: ""
+  VERSION: "0.0.0-0"
 
 jobs:
-  unzip-and-clean:
-    runs-on: ubuntu-latest
+  fetch-and-release:
+    runs-on: macos-14
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15.4'
 
-      - name: Extract all zip files to Root
-        run: |
-          for f in *.zip; do
-            [ -e "$f" ] || continue
-            echo "กำลังจัดการแตกไฟล์: $f"
-            
-            # เก็บชื่อไฟล์ดั้งเดิมแบบไม่มีนามสกุล .zip (เช่น Troll) ไว้ใช้ตรวจสอบโฟลเดอร์ย่อย
-            FOLDER_NAME="${f%.zip}"
-            
-            # แตกไฟล์ออกมาไว้ที่ root หลักตรงๆ
-            unzip -o "$f" -d ./
-            rm "$f"
-            
-            # ตรวจสอบว่าถ้าหากเกิดโฟลเดอร์ย่อยขึ้นมา (เช่นมีโฟลเดอร์ชื่อ Troll/ โผล่มาหลังแตกไฟล์)
-            if [ -d "$FOLDER_NAME" ]; then
-               echo "พบโฟลเดอร์ซ้อนชื่อ $FOLDER_NAME -> กำลังบังคับดึงไฟล์ภายในทั้งหมดออกมาที่หน้าแรก"
-               
-               # ดึงข้อมูลทุกอย่าง (รวมไฟล์ปกติและไฟล์ซ่อน) ออกมาที่หน้าแรกหลักของ Repo
-               mv "$FOLDER_NAME"/* ./ 2>/dev/null || true
-               mv "$FOLDER_NAME"/.* ./ 2>/dev/null || true
-               
-               # ลบตัวโฟลเดอร์เปล่าที่เหลือทิ้งไป
-               rm -rf "$FOLDER_NAME"
-            fi
-          done
+      - name: Checkout Repository
+        uses: actions/checkout@v4.1.1
 
-      - name: Fallback Check (For any other single nested folder)
+      - name: Install Dependencies
         run: |
-          # บล็อกสำรอง: หากชื่อโฟลเดอร์ย่อยไม่ตรงกับชื่อ zip แต่แตกมาแล้วดันมีแค่โฟลเดอร์เปล่าๆ ตัวเดียวหุ้มอยู่
-          TARGET_DIR=$(ls -d */ 2>/dev/null | grep -v -E '^(.git|.github)/$' | head -n 1)
-          NON_GIT_ITEMS=$(ls -1d */ * 2>/dev/null | grep -v -E '^(.git|.github)' | wc -l)
-          
-          if [ ! -z "$TARGET_DIR" ] && [ "$NON_GIT_ITEMS" -eq 1 ]; then
-             echo "Fallback: ตรวจพบโฟลเดอร์หุ้มชั้นนอกสุดชื่ออื่น: $TARGET_DIR -> กำลังเคลียร์ไฟล์ย่อยออกมา"
-             mv "$TARGET_DIR"* ./ 2>/dev/null || true
-             mv "$TARGET_DIR".* ./ 2>/dev/null || true
-             rm -rf "$TARGET_DIR"
-          fi
+          echo /usr/local/opt/make/libexec/gnubin >> $GITHUB_PATH
+          echo /opt/homebrew/opt/make/libexec/gnubin >> $GITHUB_PATH
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install dpkg ldid-procursus make xcbeautify openssl@3
+          VERSION_FILE="TrollFools/Version.xcconfig"
+          VERSION_MAIN=$(grep "VERSION" $VERSION_FILE | cut -d'=' -f2 | tr -d '[:space:]')
+          VERSION_BUILD=$(grep "BUILD_NUMBER" $VERSION_FILE | cut -d'=' -f2 | tr -d '[:space:]')
+          VERSION=$VERSION_MAIN-$VERSION_BUILD
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Version: $VERSION"
 
-      - name: Commit and Push Changes back to Repo
+      - name: Checkout THEOS
+        uses: actions/checkout@v4.1.1
+        with:
+          repository: theos/theos
+          ref: 942cd0c015f93d8c2d714ba0c69e7f420157c382
+          path: theos
+          submodules: recursive
+
+      - name: Add THEOS environment variables
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .
-          if ! git diff-index --quiet HEAD; then
-            git commit -m "Unpack and force flatten nested zip folder contents to root"
-            git push
-          else
-            echo "ไม่มีการเปลี่ยนแปลงโครงสร้างไฟล์เพิ่มเติม"
-          fi
+          rm -rf $GITHUB_WORKSPACE/theos/sdks
+          echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
+          echo "THEOS_PACKAGE_SCHEME=rootless" >> $GITHUB_ENV
+          echo "FINALPACKAGE=1" >> $GITHUB_ENV
+
+      - name: Checkout SDKs
+        uses: actions/checkout@v4.1.1
+        with:
+          repository: theos/sdks
+          ref: master
+          path: ${{ env.THEOS }}/sdks
+
+      - name: Patch Xcode Project with New Swift Files
+        run: |
+          python3 -c "
+          import os, uuid, re
+
+          pbx_path = 'TrollFools.xcodeproj/project.pbxproj'
+          if not os.path.exists(pbx_path):
+              print(f'[-!] Error: ไม่พบไฟล์ {pbx_path}')
+              exit(1)
+
+          with open(pbx_path, 'r') as f:
+              content = f.read()
+
+          # ค้นหาไฟล์ .swift ทั้งหมดในโฟลเดอร์ TrollFools
+          swift_files = []
+          for root, _, files in os.walk('TrollFools'):
+              for file in files:
+                  if file.endswith('.swift'):
+                      full_path = os.path.join(root, file)
+                      swift_files.append((file, full_path))
+
+          build_files = []
+          file_refs = []
+          source_ids = []
+
+          for filename, full_path in swift_files:
+              # หากไฟล์นี้ถูกลงทะเบียนไว้ใน project.pbxproj อยู่แล้ว ให้ข้ามไป
+              if f'/* {filename} */' in content or f'/* {filename} in Sources */' in content:
+                  continue
+              
+              file_ref_id = uuid.uuid4().hex[:24].upper()
+              build_file_id = uuid.uuid4().hex[:24].upper()
+              
+              rel_path = os.path.relpath(full_path, 'TrollFools')
+
+              file_refs.append(f'\t\t{file_ref_id} /* {filename} */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = \"{rel_path}\"; sourceTree = \"<group>\"; }};')
+              build_files.append(f'\t\t{build_file_id} /* {filename} in Sources */ = {{isa = PBXBuildFile; fileRef = {file_ref_id} /* {filename} */; }};')
+              source_ids.append(f'\t\t\t\t{build_file_id} /* {filename} in Sources */,')
+
+          if build_files:
+              print(f'[+] พบไฟล์ Swift ใหม่ {len(build_files)} ไฟล์! กำลังลงทะเบียนเข้า project.pbxproj...')
+              
+              content = content.replace('/* Begin PBXBuildFile section */', '/* Begin PBXBuildFile section */\n' + '\n'.join(build_files))
+              content = content.replace('/* Begin PBXFileReference section */', '/* Begin PBXFileReference section */\n' + '\n'.join(file_refs))
+              content = re.sub(r'(/\* Begin PBXSourcesBuildPhase section \*/[\s\S]*?files = \()', r'\1\n' + '\n'.join(source_ids), content, count=1)
+              
+              with open(pbx_path, 'w') as f:
+                  f.write(content)
+              print('[+] Patch project.pbxproj สำเร็จ!')
+          else:
+              print('[i] ไม่พบไฟล์ Swift ใหม่ ทุกไฟล์ลงทะเบียนครบเรียบร้อยแล้ว')
+          "
+
+      - name: Build Packages
+        run: |
+          make package
+          cp packages/*.tipa packages/*.deb .
+          find .theos/obj -name "*.dSYM" -exec cp -r {} . \;
+
+      - name: Upload Packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ env.VERSION }}
+          path: |
+            *.tipa
+            *.deb
+            *.dSYM
+
+      - name: Release
+        uses: softprops/action-gh-release@v0.1.15
+        with:
+          tag_name: v${{ env.VERSION }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+          files: |
+            *.tipa
