@@ -14,10 +14,7 @@ final class DylibImporter {
     private init() {}
     
     /// สกัดและเตรียมไฟล์ Mach-O จาก Document Picker (.dylib, .deb, .framework)
-    /// - Parameter url: URL ของไฟล์นำเข้า
-    /// - Returns: รายการ URL ของไฟล์ Mach-O ที่พร้อมนำไป Sign และ dlopen
     func prepareDylibs(from url: URL) throws -> [URL] {
-        // ให้สิทธิ์เข้าถึงไฟล์ชั่วคราวจาก Document Picker (Security Scoped URL)
         let isAccessing = url.startAccessingSecurityScopedResource()
         defer {
             if isAccessing { url.stopAccessingSecurityScopedResource() }
@@ -44,7 +41,6 @@ final class DylibImporter {
             try? fileManager.removeItem(at: destURL)
             try fileManager.copyItem(at: url, to: destURL)
             
-            // หา Binary หลักภายใน .framework
             let frameworkName = url.deletingPathExtension().lastPathComponent
             let binaryURL = destURL.appendingPathComponent(frameworkName)
             if fileManager.fileExists(atPath: binaryURL.path) {
@@ -65,13 +61,11 @@ final class DylibImporter {
             throw Error.generic("ไม่พบไฟล์ dylib หรือ framework ที่สามารถสกัดได้")
         }
         
-        // คืนค่า URL ของไฟล์ที่สกัดได้ เพื่อให้ ViewModel/TestManager นำไป Sign & Load ต่อไป
         return extractedMachOURLs
     }
     
     // MARK: - DEB Extraction Helper
     
-    /// สกัดไฟล์ .deb โดยใช้ ar / tar
     private func extractDebPayload(debURL: URL, destinationDir: URL) throws -> [URL] {
         let fileManager = FileManager.default
         let tempExtractDir = destinationDir.appendingPathComponent(UUID().uuidString)
@@ -81,30 +75,32 @@ final class DylibImporter {
             try? fileManager.removeItem(at: tempExtractDir)
         }
         
-        // 1. สกัดไฟล์ .deb ด้วย ar (ย้ายไฟล์ deb เข้าไปรันใน Temp Folder เพื่อเลี่ยงปัญหา BSD ar ไม่รองรับ --output)
-        let tempDebURL = tempExtractDir.appendingPathComponent("package.deb")
-        try fileManager.copyItem(at: debURL, to: tempDebURL)
-        
+        // 1. สกัดไฟล์ .deb ด้วย ar โดยระบุ Output Directory ใน Argument
         let arBinary = findExecutable("ar")
         
-        // รัน ar x package.deb ภายใน Directory ของ Temp
         let arRet = try Execute.rootSpawn(
             binary: arBinary.path,
-            arguments: ["x", tempDebURL.path],
-            workingDirectory: tempExtractDir.path
+            arguments: ["x", debURL.path, "--output", tempExtractDir.path]
         )
         
-        guard case let .exit(code) = arRet, code == EXIT_SUCCESS else {
-            throw Error.generic("แตกไฟล์ deb ด้วย ar ไม่สำเร็จ (Exit code: \(arRet))")
+        // หาก ar x ปฏิเสธ --output ให้ใช้ fallback ย้ายไฟล์ deb ไปแตกข้างในแทน
+        if case let .exit(code) = arRet, code != EXIT_SUCCESS {
+            let tempDebURL = tempExtractDir.appendingPathComponent("pkg.deb")
+            try? fileManager.copyItem(at: debURL, to: tempDebURL)
+            
+            _ = try Execute.rootSpawn(
+                binary: arBinary.path,
+                arguments: ["x", tempDebURL.path]
+            )
         }
         
-        // 2. ค้นหา data.tar.* (data.tar.gz, data.tar.xz, data.tar.zstd, ฯลฯ)
+        // 2. ค้นหา data.tar.*
         let contents = try fileManager.contentsOfDirectory(at: tempExtractDir, includingPropertiesForKeys: nil)
         guard let dataTarURL = contents.first(where: { $0.lastPathComponent.hasPrefix("data.tar") }) else {
             throw Error.generic("ไม่พบ data.tar ภายในไฟล์ .deb")
         }
         
-        // 3. แตกไฟล์ data.tar ด้วย tar
+        // 3. แตกไฟล์ data.tar ด้วย tar เข้าโฟลเดอร์ tempExtractDir
         let tarBinary = findExecutable("tar")
         let tarRet = try Execute.rootSpawn(
             binary: tarBinary.path,
@@ -114,7 +110,7 @@ final class DylibImporter {
             throw Error.generic("แตกไฟล์ \(dataTarURL.lastPathComponent) ไม่สำเร็จ")
         }
         
-        // 4. สแกนหา .dylib และ .framework ที่สกัดออกมาได้
+        // 4. สแกนหา .dylib และ .framework
         var resultURLs: [URL] = []
         if let enumerator = fileManager.enumerator(at: tempExtractDir, includingPropertiesForKeys: [.isDirectoryKey]) {
             for case let itemURL as URL in enumerator {
@@ -145,8 +141,6 @@ final class DylibImporter {
         
         return resultURLs
     }
-    
-    // MARK: - Executable Finder Helper
     
     private func findExecutable(_ name: String) -> URL {
         if let url = Bundle.main.url(forResource: name, withExtension: nil) {
