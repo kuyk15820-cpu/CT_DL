@@ -69,7 +69,6 @@ jobs:
           with open(pbx_path, 'r') as f:
               content = f.read()
 
-          # ค้นหาเฉพาะไฟล์ Swift ใหม่ที่สร้างขึ้นมา
           target_files = [
               'DylibTestManager.swift',
               'DylibImporter.swift',
@@ -83,14 +82,12 @@ jobs:
           source_ids = []
 
           for filename in target_files:
-              # เช็กว่ามีใน project.pbxproj แล้วหรือยัง
               if f'/* {filename} */' in content or f'/* {filename} in Sources */' in content:
                   continue
               
               file_ref_id = uuid.uuid4().hex[:24].upper()
               build_file_id = uuid.uuid4().hex[:24].upper()
               
-              # บังคับ path ให้ชี้เข้าไปที่โฟลเดอร์ TrollFools/
               file_path = f'TrollFools/{filename}'
 
               file_refs.append(f'\t\t{file_ref_id} /* {filename} */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = \"{file_path}\"; sourceTree = \"<group>\"; }};')
@@ -100,33 +97,15 @@ jobs:
           if build_files:
               print(f'[+] พบไฟล์ Swift ใหม่ {len(build_files)} ไฟล์! กำลัง Patch เข้า Xcode Project...')
               
-              # 1. แปะ PBXBuildFile
+              # 1. เพิ่มเข้า PBXBuildFile
               content = content.replace('/* Begin PBXBuildFile section */', '/* Begin PBXBuildFile section */\n' + '\n'.join(build_files))
               
-              # 2. แปะ PBXFileReference
+              # 2. เพิ่มเข้า PBXFileReference
               content = content.replace('/* Begin PBXFileReference section */', '/* Begin PBXFileReference section */\n' + '\n'.join(file_refs))
               
-              # 3. เจาะจงแปะเฉพาะใน PBXSourcesBuildPhase ของ Target TrollFools (ไม่แตะ trollfoolscli)
-              # ค้นหา PBXNativeTarget ของ TrollFools เพื่อเอา SourcesBuildPhase ID
-              target_match = re.search(r'/\* TrollFools \*/ = \{[\s\S]*?buildPhases = \(([\s\S]*?)\);', content)
-              if target_match:
-                  phases = target_match.group(1)
-                  # หา Phase ID ที่เป็น Sources
-                  sources_phase_id = None
-                  for line in phases.split('\n'):
-                      if 'Sources' in line:
-                          sources_phase_id = line.strip().split('/*')[0].strip()
-                          break
-                  
-                  if sources_phase_id:
-                      # แทนที่เฉพาะใน Sources Phase ID นั้น
-                      phase_pattern = rf'({sources_phase_id} /\* Sources \*/ = \{{[\s\S]*?files = \()'
-                      content = re.sub(phase_pattern, r'\1\n' + '\n'.join(source_ids), content)
-                      print(f'[+] เพิ่มไฟล์ลงใน Target TrollFools (ID: {sources_phase_id}) เรียบร้อย')
-                  else:
-                      print('[-!] ไม่พบ Sources Phase ของ TrollFools')
-              else:
-                  print('[-!] ไม่พบ Target TrollFools')
+              # 3. เพิ่มเข้า PBXSourcesBuildPhase ทุกที่ในโปรเจกต์ (เพื่อให้ทั้ง App และ CLI คอมไพล์ได้ผ่าน)
+              pattern = r'(isa = PBXSourcesBuildPhase;[\s\S]*?files = \()'
+              content = re.sub(pattern, r'\1\n' + '\n'.join(source_ids), content)
 
               with open(pbx_path, 'w') as f:
                   f.write(content)
