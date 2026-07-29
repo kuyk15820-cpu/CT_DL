@@ -34,13 +34,19 @@ final class DylibTestViewModel: ObservableObject {
             var newItems: [DylibItem] = []
             for fileURL in files {
                 let ext = fileURL.pathExtension.lowercased()
+                
                 if ext == "dylib" {
                     let isLoaded = DylibTestManager.shared.isLoaded(dylibURL: fileURL)
                     newItems.append(DylibItem(name: fileURL.lastPathComponent, url: fileURL, type: .dylib, isLoaded: isLoaded))
+                    
                 } else if ext == "framework" {
                     let fwkName = fileURL.deletingPathExtension().lastPathComponent
                     let binaryURL = fileURL.appendingPathComponent(fwkName)
+                    
+                    // เช็คสถานะการโหลดผ่านตัว Binary URL
                     let isLoaded = DylibTestManager.shared.isLoaded(dylibURL: binaryURL)
+                    
+                    // เก็บ URL สำหรับ Execute (binaryURL)
                     newItems.append(DylibItem(name: fileURL.lastPathComponent, url: binaryURL, type: .framework, isLoaded: isLoaded))
                 }
             }
@@ -56,7 +62,16 @@ final class DylibTestViewModel: ObservableObject {
         isLoading = true
         statusMessage = "กำลังประมวลผลไฟล์ \(url.lastPathComponent)..."
         
+        // 🔥 เพิ่มการจัดการ Security Scoped Resource สำหรับไฟล์ที่เลือกมาจาก Document Picker
+        let shouldStopAccessing = url.startAccessingSecurityScopedResource()
+        
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            defer {
+                if shouldStopAccessing {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            
             guard let self = self else { return }
             do {
                 // 1. เรียกเตรียมไฟล์จาก DylibImporter
@@ -83,6 +98,8 @@ final class DylibTestViewModel: ObservableObject {
     
     /// สลับการ Load / Unload
     func toggleLoad(item: DylibItem) {
+        isLoading = true
+        
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             do {
@@ -91,16 +108,19 @@ final class DylibTestViewModel: ObservableObject {
                     try DylibTestManager.shared.unloadDylib(at: item.url)
                     message = "Unload \(item.name) แล้ว"
                 } else {
+                    // โหลดผ่าน Manager (ซึ่งรองรับทั้ง ct_bypass + dlopen แล้ว)
                     try DylibTestManager.shared.prepareAndLoadDylib(at: item.url, forceSign: true)
                     message = "Load \(item.name) เรียบร้อย!"
                 }
                 
                 DispatchQueue.main.async {
+                    self.isLoading = false
                     self.statusMessage = message
                     self.refreshList()
                 }
             } catch {
                 DispatchQueue.main.async {
+                    self.isLoading = false
                     self.statusMessage = "ERROR: \(error.localizedDescription)"
                 }
             }
