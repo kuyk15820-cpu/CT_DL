@@ -11,7 +11,9 @@ import MachOKit
 /// ข้อผิดพลาดที่อาจเกิดขึ้นระหว่างการทดสอบ Dylib
 enum DylibTestError: LocalizedError {
     case dylibNotFound(String)
+    case executableNotFound(String)
     case signingFailed(String)
+    case ctBypassFailed(String)
     case loadFailed(String)
     case unloadFailed(String)
     case dylibNotLoaded
@@ -20,8 +22,12 @@ enum DylibTestError: LocalizedError {
         switch self {
         case let .dylibNotFound(path):
             return "ไม่พบไฟล์ dylib ที่ตำแหน่ง: \(path)"
+        case let .executableNotFound(name):
+            return "ไม่พบไฟล์ Helper Executable: \(name)"
         case let .signingFailed(reason):
             return "การเซ็นสัญญาด้วย ldid ล้มเหลว: \(reason)"
+        case let .ctBypassFailed(reason):
+            return "การทำ CoreTrust Bypass (ct_bypass) ล้มเหลว: \(reason)"
         case let .loadFailed(reason):
             return "dlopen ล้มเหลว: \(reason)"
         case let .unloadFailed(reason):
@@ -42,21 +48,33 @@ final class DylibTestManager {
 
     // MARK: - Sign & Load Workflow
 
-    /// ทดสอบ Sign dylib ด้วย ldid แล้วโหลดเข้า Process ตัวเองผ่าน dlopen
+    /// ทดสอบ Sign, Bypass CoreTrust และโหลด dylib เข้า Process ตัวเองผ่าน dlopen
     /// - Parameters:
     ///   - dylibURL: ตำแหน่งของไฟล์ .dylib ที่ต้องการโหลด
-    ///   - forceSign: บังคับให้เซ็น ad-hoc ใหม่ด้วย ldid เสมอหรือไม่
+    ///   - forceSign: บังคับให้เซ็นใหม่และทำ ct_bypass เสมอหรือไม่
+    ///   - teamID: Team ID สำหรับการทำ ct_bypass (หากไม่ใส่จะดึงจาก Bundle หรือใช้ค่า Default)
     /// - Returns: `UnsafeMutableRawPointer` pointer ของ handle ที่ได้จาก dlopen
     @discardableResult
-    func prepareAndLoadDylib(at dylibURL: URL, forceSign: Bool = true) throws -> UnsafeMutableRawPointer {
+    func prepareAndLoadDylib(
+        at dylibURL: URL,
+        forceSign: Bool = true,
+        teamID: String? = nil
+    ) throws -> UnsafeMutableRawPointer {
         guard FileManager.default.fileExists(atPath: dylibURL.path) else {
             throw DylibTestError.dylibNotFound(dylibURL.path)
         }
 
-        // 1. ทำการ Pseudo-Sign ไฟล์ dylib ด้วย ldid ก่อน (อ้างอิงจาก InjectorV3+Command ของ TrollFools)
+        // 1. ทำการ Pseudo-Sign ไฟล์ dylib ด้วย ldid
         try pseudoSignDylib(dylibURL, force: forceSign)
 
-        // 2. เรียก dlopen เพื่อ Map dylib เข้า Memory ของแอปเราเอง
+        // 2. 🔥 ขั้นตอนสำคัญ: ทำ CoreTrust Bypass (ct_bypass) เพื่อให้ Kernel ยอมรับ dlopen
+        let targetTeamID = teamID ?? getAppTeamID()
+        try applyCoreTrustBypass(dylibURL, teamID: targetTeamID)
+
+        // 3. ปรับสิทธิ์ Owner ของไฟล์ (chown 33:33 / mobile:mobile) ป้องกัน permission denied
+        try? changeOwnerToMobile(dylibURL)
+
+        // 4. เรียก dlopen เพื่อ Map dylib เข้า Memory ของแอป
         return try loadDylib(at: dylibURL)
     }
 
@@ -103,11 +121,11 @@ final class DylibTestManager {
         return loadedHandles[dylibURL] != nil
     }
 
-    // MARK: - ldid Helpers (ถอดโครงสร้างมาจาก InjectorV3)
+    // MARK: - TrollFools Core Signing & Bypass Helpers
 
-    /// ใช้ ldid เพื่อลงนาม Ad-hoc ให้ dylib ก่อนนำมาสั่ง dlopen
+    /// ใช้ ldid เพื่อลงนาม Ad-hoc ให้ dylib
     private func pseudoSignDylib(_ target: URL, force: Bool = false) throws {
-        let ldidExecutableURL = findLdidExecutable()
+        let ldidExecutableURL = try findExecutable("ldid")
 
         var hasCodeSign = false
 
@@ -135,33 +153,59 @@ final class DylibTestManager {
             }
         }
 
-        // หากมี Sign อยู่แล้วและไม่โดนขอบังคับ force ให้ข้ามไปได้เลย
         if hasCodeSign && !force {
             return
         }
 
         // สั่ง ldid -S [target] เพื่อลงนาม Ad-hoc
-        // Dylib ทั่วไปใช้การลงนามแบบ -S ธรรมดา ไม่ต้องดึง entitlements ออกมาแบบไฟล์ Executable หลัก
         let retCode = try Execute.rootSpawn(
             binary: ldidExecutableURL.path,
             arguments: ["-S", target.path]
         )
 
         guard case let .exit(code) = retCode, code == EXIT_SUCCESS else {
-            throw DylibTestError.signingFailed("ldid ออกด้วยค่านิรนาม code \(retCode)")
+            throw DylibTestError.signingFailed("ldid exited with code \(retCode)")
         }
 
         print("[DylibTestManager] ldid pseudo-sign สำเร็จ: \(target.lastPathComponent)")
     }
 
-    /// ค้นหา ldid binary ตามสไตล์ TrollFools
-    private func findLdidExecutable() -> URL {
-        if let url = Bundle.main.url(forResource: "ldid", withExtension: nil) {
+    /// 🔥 ใช้ ct_bypass เพื่อทำ CoreTrust Bypass (จุดที่แก้ให้ dlopen ผ่าน)
+    private func applyCoreTrustBypass(_ target: URL, teamID: String) throws {
+        let ctBypassURL = try findExecutable("ct_bypass")
+
+        // รันคำสั่ง: ct_bypass -r -i [target.path] -t [teamID]
+        let retCode = try Execute.rootSpawn(
+            binary: ctBypassURL.path,
+            arguments: ["-r", "-i", target.path, "-t", teamID]
+        )
+
+        guard case let .exit(code) = retCode, code == EXIT_SUCCESS else {
+            throw DylibTestError.ctBypassFailed("ct_bypass exited with code \(retCode)")
+        }
+
+        print("[DylibTestManager] ct_bypass สำเร็จสำหรับ TeamID (\(teamID)): \(target.lastPathComponent)")
+    }
+
+    /// เปลี่ยน Owner ของไฟล์ dylib ให้เป็น mobile/installd (UID 33)
+    private func changeOwnerToMobile(_ target: URL) throws {
+        guard let chownURL = try? findExecutable("chown") else { return }
+        _ = try? Execute.rootSpawn(
+            binary: chownURL.path,
+            arguments: ["33:33", target.path]
+        )
+    }
+
+    // MARK: - Utility Helpers
+
+    /// ค้นหา Helper Binary ต่างๆ (ldid, ct_bypass, chown)
+    private func findExecutable(_ name: String) throws -> URL {
+        if let url = Bundle.main.url(forResource: name, withExtension: nil) {
             return url
         }
         if let firstArg = ProcessInfo.processInfo.arguments.first {
             let execURL = URL(fileURLWithPath: firstArg)
-                .deletingLastPathComponent().appendingPathComponent("ldid")
+                .deletingLastPathComponent().appendingPathComponent(name)
             if FileManager.default.isExecutableFile(atPath: execURL.path) {
                 return execURL
             }
@@ -169,11 +213,19 @@ final class DylibTestManager {
         if let tfProxy = LSApplicationProxy(forIdentifier: Constants.gAppIdentifier),
            let tfBundleURL = tfProxy.bundleURL()
         {
-            let execURL = tfBundleURL.appendingPathComponent("ldid")
+            let execURL = tfBundleURL.appendingPathComponent(name)
             if FileManager.default.isExecutableFile(atPath: execURL.path) {
                 return execURL
             }
         }
-        fatalError("ไม่พบไฟล์ executable 'ldid'")
+        throw DylibTestError.executableNotFound(name)
+    }
+
+    /// ดึง Team ID ของตัวแอปปัจจุบัน
+    private func getAppTeamID() -> String {
+        if let teamID = Bundle.main.infoDictionary?["AppIdentifierPrefix"] as? String {
+            return teamID.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        }
+        return "0000000000" // Default fallback Team ID สำหรับ TrollStore
     }
 }
