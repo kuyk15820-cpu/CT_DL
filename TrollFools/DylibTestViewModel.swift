@@ -13,30 +13,41 @@ final class DylibTestViewModel: ObservableObject {
     
     /// โหลดลิสต์ไฟล์ทั้งหมดที่มีอยู่ใน Directory ออกมาแสดง
     func refreshList() {
-        let fileManager = FileManager.default
-        let workingDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ImportedPayloads", isDirectory: true)
-        
-        guard let files = try? fileManager.contentsOfDirectory(at: workingDir, includingPropertiesForKeys: nil) else {
-            return
-        }
-        
-        var newItems: [DylibItem] = []
-        for fileURL in files {
-            let ext = fileURL.pathExtension.lowercased()
-            if ext == "dylib" {
-                let isLoaded = DylibTestManager.shared.isLoaded(dylibURL: fileURL)
-                newItems.append(DylibItem(name: fileURL.lastPathComponent, url: fileURL, type: .dylib, isLoaded: isLoaded))
-            } else if ext == "framework" {
-                let fwkName = fileURL.deletingPathExtension().lastPathComponent
-                let binaryURL = fileURL.appendingPathComponent(fwkName)
-                let isLoaded = DylibTestManager.shared.isLoaded(dylibURL: binaryURL)
-                newItems.append(DylibItem(name: fileURL.lastPathComponent, url: binaryURL, type: .framework, isLoaded: isLoaded))
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            
+            let fileManager = FileManager.default
+            let workingDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("ImportedPayloads", isDirectory: true)
+            
+            guard let files = try? fileManager.contentsOfDirectory(
+                at: workingDir,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                DispatchQueue.main.async {
+                    self.items = []
+                }
+                return
             }
-        }
-        
-        DispatchQueue.main.async {
-            self.items = newItems
+            
+            var newItems: [DylibItem] = []
+            for fileURL in files {
+                let ext = fileURL.pathExtension.lowercased()
+                if ext == "dylib" {
+                    let isLoaded = DylibTestManager.shared.isLoaded(dylibURL: fileURL)
+                    newItems.append(DylibItem(name: fileURL.lastPathComponent, url: fileURL, type: .dylib, isLoaded: isLoaded))
+                } else if ext == "framework" {
+                    let fwkName = fileURL.deletingPathExtension().lastPathComponent
+                    let binaryURL = fileURL.appendingPathComponent(fwkName)
+                    let isLoaded = DylibTestManager.shared.isLoaded(dylibURL: binaryURL)
+                    newItems.append(DylibItem(name: fileURL.lastPathComponent, url: binaryURL, type: .framework, isLoaded: isLoaded))
+                }
+            }
+            
+            DispatchQueue.main.async {
+                self.items = newItems
+            }
         }
     }
     
@@ -45,12 +56,20 @@ final class DylibTestViewModel: ObservableObject {
         isLoading = true
         statusMessage = "กำลังประมวลผลไฟล์ \(url.lastPathComponent)..."
         
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
             do {
-                let loadedURLs = try DylibImporter.shared.processAndLoadImportedFile(at: url)
+                // 1. เรียกเตรียมไฟล์จาก DylibImporter
+                let dylibURLs = try DylibImporter.shared.prepareDylibs(from: url)
+                
+                // 2. ส่งไฟล์ที่สกัดได้ไป Sign และ Load ผ่าน DylibTestManager
+                for dylibURL in dylibURLs {
+                    try DylibTestManager.shared.prepareAndLoadDylib(at: dylibURL, forceSign: true)
+                }
+                
                 DispatchQueue.main.async {
                     self.isLoading = false
-                    self.statusMessage = "SUCCESS: โหลดสำเร็จ (\(loadedURLs.count) ไฟล์)"
+                    self.statusMessage = "SUCCESS: โหลดสำเร็จ (\(dylibURLs.count) ไฟล์)"
                     self.refreshList()
                 }
             } catch {
@@ -64,17 +83,27 @@ final class DylibTestViewModel: ObservableObject {
     
     /// สลับการ Load / Unload
     func toggleLoad(item: DylibItem) {
-        do {
-            if item.isLoaded {
-                try DylibTestManager.shared.unloadDylib(at: item.url)
-                statusMessage = "Unload \(item.name) แล้ว"
-            } else {
-                try DylibTestManager.shared.prepareAndLoadDylib(at: item.url, forceSign: true)
-                statusMessage = "Load \(item.name) เรียบร้อย!"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            do {
+                let message: String
+                if item.isLoaded {
+                    try DylibTestManager.shared.unloadDylib(at: item.url)
+                    message = "Unload \(item.name) แล้ว"
+                } else {
+                    try DylibTestManager.shared.prepareAndLoadDylib(at: item.url, forceSign: true)
+                    message = "Load \(item.name) เรียบร้อย!"
+                }
+                
+                DispatchQueue.main.async {
+                    self.statusMessage = message
+                    self.refreshList()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.statusMessage = "ERROR: \(error.localizedDescription)"
+                }
             }
-            refreshList()
-        } catch {
-            statusMessage = "ERROR: \(error.localizedDescription)"
         }
     }
 }
