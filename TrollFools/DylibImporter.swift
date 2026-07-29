@@ -1,140 +1,183 @@
+//
+//  DylibImporter.swift
+//  TrollFools
+//
+//  Created for Dynamic File Import & Load (dylib, deb, framework)
+//
+
 import Foundation
+import UniformTypeIdentifiers
 
-public enum DylibLoadError: LocalizedError {
-    case fileNotFound
-    case unsupportedType
-    case extractionFailed
-    case signFailed
-    case dlopenFailed(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .fileNotFound:
-            return "ไม่พบไฟล์ที่เลือก"
-        case .unsupportedType:
-            return "รองรับเฉพาะไฟล์ .dylib, .deb, .zip หรือ .framework"
-        case .extractionFailed:
-            return "ไม่สามารถแตกไฟล์ .deb / .zip ได้"
-        case .signFailed:
-            return "ไม่สามารถทำ Code Sign (ldid) บน dylib ได้"
-        case .dlopenFailed(let message):
-            return "dlopen ล้มเหลว: \(message)"
-        }
-    }
-}
-
-public class DylibImporter {
-    public static let shared = DylibImporter()
-
+final class DylibImporter {
+    static let shared = DylibImporter()
+    
     private init() {}
-
-    /// ค้นหา ldid executable จากใน Bundle
-    private var ldidURL: URL? {
-        if let url = Bundle.main.url(forResource: "ldid", withExtension: nil) {
+    
+    /// สกัดและเตรียมไฟล์ Mach-O จาก Document Picker (.dylib, .deb, .framework)
+    /// - Parameter url: URL ของไฟล์นำเข้า
+    /// - Returns: รายการ URL ของไฟล์ Mach-O ที่พร้อมนำไป Sign และ dlopen
+    func prepareDylibs(from url: URL) throws -> [URL] {
+        // ให้สิทธิ์เข้าถึงไฟล์ชั่วคราวจาก Document Picker (Security Scoped URL)
+        let isAccessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if isAccessing { url.stopAccessingSecurityScopedResource() }
+        }
+        
+        let ext = url.pathExtension.lowercased()
+        var extractedMachOURLs: [URL] = []
+        
+        let fileManager = FileManager.default
+        let workingDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ImportedPayloads", isDirectory: true)
+        
+        try? fileManager.createDirectory(at: workingDir, withIntermediateDirectories: true)
+        
+        switch ext {
+        case "dylib":
+            let destURL = workingDir.appendingPathComponent(url.lastPathComponent)
+            try? fileManager.removeItem(at: destURL)
+            try fileManager.copyItem(at: url, to: destURL)
+            extractedMachOURLs.append(destURL)
+            
+        case "framework":
+            let destURL = workingDir.appendingPathComponent(url.lastPathComponent)
+            try? fileManager.removeItem(at: destURL)
+            try fileManager.copyItem(at: url, to: destURL)
+            
+            // หา Binary หลักภายใน .framework
+            let frameworkName = url.deletingPathExtension().lastPathComponent
+            let binaryURL = destURL.appendingPathComponent(frameworkName)
+            if fileManager.fileExists(atPath: binaryURL.path) {
+                extractedMachOURLs.append(binaryURL)
+            } else {
+                throw Error.generic("ไม่พบไฟล์ Binary หลักภายใน Framework: \(frameworkName)")
+            }
+            
+        case "deb":
+            let extractedURLs = try extractDebPayload(debURL: url, destinationDir: workingDir)
+            extractedMachOURLs.append(contentsOf: extractedURLs)
+            
+        default:
+            throw Error.generic("ไม่รองรับไฟล์ประเภท .\(ext)")
+        }
+        
+        guard !extractedMachOURLs.isEmpty else {
+            throw Error.generic("ไม่พบไฟล์ dylib หรือ framework ที่สามารถสกัดได้")
+        }
+        
+        // คืนค่า URL ของไฟล์ที่สกัดได้ เพื่อให้ ViewModel/TestManager นำไป Sign & Load ต่อไป
+        return extractedMachOURLs
+    }
+    
+    // MARK: - DEB Extraction Helper
+    
+    /// สกัดไฟล์ .deb โดยใช้ ar / tar
+    private func extractDebPayload(debURL: URL, destinationDir: URL) throws -> [URL] {
+        let fileManager = FileManager.default
+        let tempExtractDir = destinationDir.appendingPathComponent(UUID().uuidString)
+        try fileManager.createDirectory(at: tempExtractDir, withIntermediateDirectories: true)
+        
+        defer {
+            try? fileManager.removeItem(at: tempExtractDir)
+        }
+        
+        // 1. สกัดไฟล์ .deb ด้วย ar (ย้ายไฟล์ deb เข้าไปรันใน Temp Folder เพื่อเลี่ยงปัญหา BSD ar ไม่รองรับ --output)
+        let tempDebURL = tempExtractDir.appendingPathComponent("package.deb")
+        try fileManager.copyItem(at: debURL, to: tempDebURL)
+        
+        let arBinary = findExecutable("ar")
+        
+        // รัน ar x package.deb ภายใน Directory ของ Temp
+        let arRet = try Execute.rootSpawn(
+            binary: arBinary.path,
+            arguments: ["x", tempDebURL.path],
+            workingDirectory: tempExtractDir.path
+        )
+        
+        guard case let .exit(code) = arRet, code == EXIT_SUCCESS else {
+            throw Error.generic("แตกไฟล์ deb ด้วย ar ไม่สำเร็จ (Exit code: \(arRet))")
+        }
+        
+        // 2. ค้นหา data.tar.* (data.tar.gz, data.tar.xz, data.tar.zstd, ฯลฯ)
+        let contents = try fileManager.contentsOfDirectory(at: tempExtractDir, includingPropertiesForKeys: nil)
+        guard let dataTarURL = contents.first(where: { $0.lastPathComponent.hasPrefix("data.tar") }) else {
+            throw Error.generic("ไม่พบ data.tar ภายในไฟล์ .deb")
+        }
+        
+        // 3. แตกไฟล์ data.tar ด้วย tar
+        let tarBinary = findExecutable("tar")
+        let tarRet = try Execute.rootSpawn(
+            binary: tarBinary.path,
+            arguments: ["-xf", dataTarURL.path, "-C", tempExtractDir.path]
+        )
+        guard case let .exit(tarCode) = tarRet, tarCode == EXIT_SUCCESS else {
+            throw Error.generic("แตกไฟล์ \(dataTarURL.lastPathComponent) ไม่สำเร็จ")
+        }
+        
+        // 4. สแกนหา .dylib และ .framework ที่สกัดออกมาได้
+        var resultURLs: [URL] = []
+        if let enumerator = fileManager.enumerator(at: tempExtractDir, includingPropertiesForKeys: [.isDirectoryKey]) {
+            for case let itemURL as URL in enumerator {
+                let ext = itemURL.pathExtension.lowercased()
+                if ext == "dylib" {
+                    let destDylib = destinationDir.appendingPathComponent(itemURL.lastPathComponent)
+                    try? fileManager.removeItem(at: destDylib)
+                    try fileManager.copyItem(at: itemURL, to: destDylib)
+                    resultURLs.append(destDylib)
+                } else if ext == "framework" {
+                    let destFwk = destinationDir.appendingPathComponent(itemURL.lastPathComponent)
+                    try? fileManager.removeItem(at: destFwk)
+                    try fileManager.copyItem(at: itemURL, to: destFwk)
+                    
+                    let fwkName = itemURL.deletingPathExtension().lastPathComponent
+                    let binaryURL = destFwk.appendingPathComponent(fwkName)
+                    if fileManager.fileExists(atPath: binaryURL.path) {
+                        resultURLs.append(binaryURL)
+                    }
+                    enumerator.skipDescendants()
+                }
+            }
+        }
+        
+        guard !resultURLs.isEmpty else {
+            throw Error.generic("ไม่พบไฟล์ .dylib หรือ .framework ภายในแพ็กเกจ .deb")
+        }
+        
+        return resultURLs
+    }
+    
+    // MARK: - Executable Finder Helper
+    
+    private func findExecutable(_ name: String) -> URL {
+        if let url = Bundle.main.url(forResource: name, withExtension: nil) {
             return url
         }
         if let firstArg = ProcessInfo.processInfo.arguments.first {
-            let execURL = URL(fileURLWithPath: firstArg).deletingLastPathComponent().appendingPathComponent("ldid")
+            let execURL = URL(fileURLWithPath: firstArg)
+                .deletingLastPathComponent().appendingPathComponent(name)
             if FileManager.default.isExecutableFile(atPath: execURL.path) {
                 return execURL
             }
         }
-        return nil
-    }
-
-    /// ขั้นตอนที่ 1 & 2: Preprocess และแตกไฟล์ถ้าเป็น deb/zip
-    public func prepareDylibs(from sourceURL: URL) throws -> [URL] {
-        let fileManager = FileManager.default
-
-        // ขอสิทธิ์อ่านไฟล์ข้าม Sandbox (Security Scoped Bookmark)
-        let isAccessing = sourceURL.startAccessingSecurityScopedResource()
-        defer {
-            if isAccessing {
-                sourceURL.stopAccessingSecurityScopedResource()
+        if let tfProxy = LSApplicationProxy(forIdentifier: Constants.gAppIdentifier),
+           let tfBundleURL = tfProxy.bundleURL()
+        {
+            let execURL = tfBundleURL.appendingPathComponent(name)
+            if FileManager.default.isExecutableFile(atPath: execURL.path) {
+                return execURL
             }
         }
-
-        guard fileManager.fileExists(atPath: sourceURL.path) else {
-            throw DylibLoadError.fileNotFound
-        }
-
-        let ext = sourceURL.pathExtension.lowercased()
-
-        // ถ้าส่ง .dylib หรือ .framework มาตรงๆ
-        if ext == "dylib" || ext == "framework" {
-            let targetURL = getDestinationURL(for: sourceURL.lastPathComponent)
-            if fileManager.fileExists(atPath: targetURL.path) {
-                try? fileManager.removeItem(at: targetURL)
-            }
-            try fileManager.copyItem(at: sourceURL, to: targetURL)
-            return [targetURL]
-        }
-
-        // ถ้าเป็น .deb หรือ .zip ให้ใช้ InjectorV3.main.preprocessAssets ช่วยแตกไฟล์
-        if ext == "deb" || ext == "zip" {
-            let extractedURLs = try InjectorV3.main.preprocessAssets([sourceURL])
-            var finalDylibs = [URL]()
-
-            for url in extractedURLs {
-                let targetURL = getDestinationURL(for: url.lastPathComponent)
-                if fileManager.fileExists(atPath: targetURL.path) {
-                    try? fileManager.removeItem(at: targetURL)
-                }
-                try fileManager.copyItem(at: url, to: targetURL)
-                finalDylibs.append(targetURL)
-            }
-
-            guard !finalDylibs.isEmpty else {
-                throw DylibLoadError.extractionFailed
-            }
-            return finalDylibs
-        }
-
-        throw DylibLoadError.unsupportedType
+        fatalError("ไม่พบไฟล์ executable '\(name)' ในระบบ")
     }
+}
 
-    /// ขั้นตอนที่ 3: สั่ง ldid -S เพื่อ Sign dylib ก่อนสั่ง dlopen
-    public func signDylib(at url: URL) throws {
-        guard let ldid = ldidURL else {
-            // ถ้าไม่พบ ldid ให้ข้ามไป
-            return
+extension DylibImporter {
+    enum Error: LocalizedError {
+        case generic(String)
+        var errorDescription: String? {
+            switch self {
+            case .generic(let msg): return msg
+            }
         }
-
-        let receipt = AuxiliaryExecute.spawn(
-            command: ldid.path,
-            args: ["-S", url.path]
-        )
-
-        if case let .exit(code) = receipt.terminationReason, code == EXIT_SUCCESS {
-            return
-        } else {
-            throw DylibLoadError.signFailed
-        }
-    }
-
-    /// ขั้นตอนที่ 4: สั่ง dlopen โหลดเข้า Memory Process
-    public func loadDylib(at url: URL) throws -> UnsafeMutableRawPointer {
-        // Sign ก่อนทุกครั้ง
-        try? signDylib(at: url)
-
-        // เคลียร์ dlerror
-        dlerror()
-
-        // เรียก dlopen
-        let handle = dlopen(url.path, RTLD_NOW)
-
-        if let handle = handle {
-            return handle
-        } else {
-            let errorMsg = dlerror().map { String(cString: $0) } ?? "Unknown error"
-            throw DylibLoadError.dlopenFailed(errorMsg)
-        }
-    }
-
-    private func getDestinationURL(for filename: String) -> URL {
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let dylibDir = documents.appendingPathComponent("ImportedDylibs", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dylibDir, withIntermediateDirectories: true)
-        return dylibDir.appendingPathComponent(filename)
     }
 }
