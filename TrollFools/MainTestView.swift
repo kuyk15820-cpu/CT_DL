@@ -6,9 +6,47 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+// MARK: - Helper Models (สำหรับการแสดงผล UI)
+
+enum PayloadType {
+    case dylib
+    case framework
+
+    var iconName: String {
+        switch self {
+        case .dylib:
+            return "shippingbox.fill"
+        case .framework:
+            return "cube.transparent.fill"
+        }
+    }
+}
+
+struct DylibItem: Identifiable {
+    let id = UUID()
+    let name: String
+    let url: URL
+    let type: PayloadType
+    var isLoaded: Bool
+}
+
+// MARK: - Main Test View
+
 struct MainTestView: View {
     @StateObject private var viewModel = DylibTestViewModel()
     @State private var isImporterPresented = false
+    
+    // 🔥 จัดเตรียม UTType สำหรับไฟล์ dylib และ deb แบบปลอดภัย (Non-crashing)
+    private var allowedTypes: [UTType] {
+        var types: [UTType] = [.bundle, .framework, .package, .zip, .data]
+        if let dylibType = UTType(filenameExtension: "dylib") {
+            types.append(dylibType)
+        }
+        if let debType = UTType(filenameExtension: "deb") {
+            types.append(debType)
+        }
+        return types
+    }
     
     var body: some View {
         NavigationView {
@@ -84,6 +122,7 @@ struct MainTestView: View {
                         Image(systemName: "plus.circle.fill")
                             .font(.title3)
                     }
+                    .disabled(viewModel.isLoading) // 🔥 ปิดปุ่มกดซ้ำขณะกำลังประมวลผล
                 }
             }
             .onAppear {
@@ -91,14 +130,7 @@ struct MainTestView: View {
             }
             .fileImporter(
                 isPresented: $isImporterPresented,
-                allowedContentTypes: [
-                    .init(filenameExtension: "dylib")!,
-                    .init(filenameExtension: "deb")!,
-                    .bundle,
-                    .framework,
-                    .package,
-                    .zip,
-                ],
+                allowedContentTypes: allowedTypes,
                 allowsMultipleSelection: false
             ) { result in
                 switch result {
