@@ -91,7 +91,14 @@ struct MainTestView: View {
             }
             .fileImporter(
                 isPresented: $isImporterPresented,
-                allowedContentTypes: [.dylib, .deb, .framework, .item],
+                allowedContentTypes: [
+                    .init(filenameExtension: "dylib")!,
+                    .init(filenameExtension: "deb")!,
+                    .bundle,
+                    .framework,
+                    .package,
+                    .zip,
+                ],
                 allowsMultipleSelection: false
             ) { result in
                 switch result {
