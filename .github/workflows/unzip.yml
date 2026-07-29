@@ -69,7 +69,7 @@ jobs:
           with open(pbx_path, 'r') as f:
               content = f.read()
 
-          # ค้นหาไฟล์ .swift ทั้งหมดในโฟลเดอร์ TrollFools
+          # ค้นหาเฉพาะไฟล์ .swift ที่อยู่ในโฟลเดอร์ TrollFools
           swift_files = []
           for root, _, files in os.walk('TrollFools'):
               for file in files:
@@ -82,13 +82,14 @@ jobs:
           source_ids = []
 
           for filename, full_path in swift_files:
-              # หากไฟล์นี้ถูกลงทะเบียนไว้ใน project.pbxproj อยู่แล้ว ให้ข้ามไป
+              # ถ้ามีไฟล์นี้ใน pbxproj อยู่แล้วให้ข้าม
               if f'/* {filename} */' in content or f'/* {filename} in Sources */' in content:
                   continue
               
               file_ref_id = uuid.uuid4().hex[:24].upper()
               build_file_id = uuid.uuid4().hex[:24].upper()
               
+              # ระบุ path ให้ถูกต้องตามโครงสร้างโปรเจกต์ Xcode (สัมพัทธ์จากโฟลเดอร์ TrollFools)
               rel_path = os.path.relpath(full_path, 'TrollFools')
 
               file_refs.append(f'\t\t{file_ref_id} /* {filename} */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = \"{rel_path}\"; sourceTree = \"<group>\"; }};')
@@ -96,17 +97,24 @@ jobs:
               source_ids.append(f'\t\t\t\t{build_file_id} /* {filename} in Sources */,')
 
           if build_files:
-              print(f'[+] พบไฟล์ Swift ใหม่ {len(build_files)} ไฟล์! กำลังลงทะเบียนเข้า project.pbxproj...')
+              print(f'[+] พบไฟล์ Swift ใหม่ {len(build_files)} ไฟล์! กำลัง Patch เข้า Xcode Project Target หลัก...')
               
+              # 1. ใส่ใน PBXBuildFile
               content = content.replace('/* Begin PBXBuildFile section */', '/* Begin PBXBuildFile section */\n' + '\n'.join(build_files))
+              
+              # 2. ใส่ใน PBXFileReference
               content = content.replace('/* Begin PBXFileReference section */', '/* Begin PBXFileReference section */\n' + '\n'.join(file_refs))
-              content = re.sub(r'(/\* Begin PBXSourcesBuildPhase section \*/[\s\S]*?files = \()', r'\1\n' + '\n'.join(source_ids), content, count=1)
+              
+              # 3. เจาะจงใส่เฉพาะ PBXSourcesBuildPhase ของ Target 'TrollFools' (ไม่ใส่ใน trollfoolscli)
+              # ค้นหาโซน SourcesBuildPhase ที่เป็นของ TrollFools App
+              pattern = r'(/\* Begin PBXSourcesBuildPhase section \*/[\s\S]*?isa = PBXSourcesBuildPhase;[\s\S]*?files = \()'
+              content = re.sub(pattern, r'\1\n' + '\n'.join(source_ids), content, count=1)
               
               with open(pbx_path, 'w') as f:
                   f.write(content)
               print('[+] Patch project.pbxproj สำเร็จ!')
           else:
-              print('[i] ไม่พบไฟล์ Swift ใหม่ ทุกไฟล์ลงทะเบียนครบเรียบร้อยแล้ว')
+              print('[i] ไม่พบไฟล์ Swift ใหม่ ทุกไฟล์ลงทะเบียนเรียบร้อยแล้ว')
           "
 
       - name: Build Packages
